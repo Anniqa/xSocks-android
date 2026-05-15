@@ -58,6 +58,9 @@
 
 #include <string.h>
 
+u16_t g_tcp_wnd = TCP_WND;
+u16_t g_tcp_snd_buf = TCP_SND_BUF;
+
 #ifndef TCP_LOCAL_PORT_RANGE_START
 /* From http://www.iana.org/assignments/port-numbers:
    "The Dynamic and/or Private Ports are those from 49152 through 65535" */
@@ -175,7 +178,7 @@ tcp_close_shutdown(struct tcp_pcb *pcb, u8_t rst_on_unacked_data)
   err_t err;
 
   if (rst_on_unacked_data && ((pcb->state == ESTABLISHED) || (pcb->state == CLOSE_WAIT))) {
-    if ((pcb->refused_data != NULL) || (pcb->rcv_wnd != TCP_WND)) {
+    if ((pcb->refused_data != NULL) || (pcb->rcv_wnd != g_tcp_wnd)) {
       /* Not all data received by application, send RST to tell the remote
          side about this. */
       LWIP_ASSERT("pcb->flags & TF_RXCLOSED", pcb->flags & TF_RXCLOSED);
@@ -642,7 +645,7 @@ u32_t tcp_update_rcv_ann_wnd(struct tcp_pcb *pcb)
 {
   u32_t new_right_edge = pcb->rcv_nxt + pcb->rcv_wnd;
 
-  if (TCP_SEQ_GEQ(new_right_edge, pcb->rcv_ann_right_edge + LWIP_MIN((TCP_WND / 2), pcb->mss))) {
+  if (TCP_SEQ_GEQ(new_right_edge, pcb->rcv_ann_right_edge + LWIP_MIN((g_tcp_wnd / 2), pcb->mss))) {
     /* we can advertise more window */
     pcb->rcv_ann_wnd = pcb->rcv_wnd;
     return new_right_edge - pcb->rcv_ann_right_edge;
@@ -681,8 +684,8 @@ tcp_recved(struct tcp_pcb *pcb, u16_t len)
               len <= 0xffff - pcb->rcv_wnd );
 
   pcb->rcv_wnd += len;
-  if (pcb->rcv_wnd > TCP_WND) {
-    pcb->rcv_wnd = TCP_WND;
+  if (pcb->rcv_wnd > g_tcp_wnd) {
+    pcb->rcv_wnd = g_tcp_wnd;
   }
 
   wnd_inflation = tcp_update_rcv_ann_wnd(pcb);
@@ -697,7 +700,7 @@ tcp_recved(struct tcp_pcb *pcb, u16_t len)
   }
 
   LWIP_DEBUGF(TCP_DEBUG, ("tcp_recved: recveived %"U16_F" bytes, wnd %"U16_F" (%"U16_F").\n",
-         len, pcb->rcv_wnd, TCP_WND - pcb->rcv_wnd));
+         len, pcb->rcv_wnd, g_tcp_wnd - pcb->rcv_wnd));
 }
 
 /**
@@ -1164,7 +1167,7 @@ tcp_process_refused_data(struct tcp_pcb *pcb)
     if (refused_flags & PBUF_FLAG_TCP_FIN) {
       /* correct rcv_wnd as the application won't call tcp_recved()
          for the FIN's seqno */
-      if (pcb->rcv_wnd != TCP_WND) {
+      if (pcb->rcv_wnd != g_tcp_wnd) {
         pcb->rcv_wnd++;
       }
       TCP_EVENT_CLOSED(pcb, err);
@@ -1372,10 +1375,11 @@ tcp_alloc(u8_t prio)
   if (pcb != NULL) {
     memset(pcb, 0, sizeof(struct tcp_pcb));
     pcb->prio = prio;
-    pcb->snd_buf = TCP_SND_BUF;
+    pcb->snd_buf = g_tcp_snd_buf;
     pcb->snd_queuelen = 0;
-    pcb->rcv_wnd = TCP_WND;
-    pcb->rcv_ann_wnd = TCP_WND;
+    pcb->rcv_wnd = g_tcp_wnd;
+    pcb->rcv_ann_wnd = g_tcp_wnd;
+    pcb->snd_wnd = g_tcp_wnd;
     pcb->tos = 0;
     pcb->ttl = TCP_TTL;
     /* As initial send MSS, we use TCP_MSS but limit it to 536.

@@ -28,9 +28,11 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
 #include <limits.h>
+#include <errno.h>
 
 #include <misc/version.h>
 #include <misc/loggers_string.h>
@@ -70,6 +72,10 @@
 
 #include <generated/blog_channel_tun2socks.h>
 
+extern u16_t g_tcp_wnd;
+extern u16_t g_tcp_snd_buf;
+int g_socks_buf_size = CLIENT_SOCKS_RECV_BUF_SIZE;
+
 #ifdef ANDROID
 
 #include <ancillary.h>
@@ -79,6 +85,7 @@
 #include <structure/BAVL.h>
 
 BAVL connections_tree;
+static int connections_tree_initialized = 0;
 typedef struct {
     BAddr local_addr;
     BAddr remote_addr;
@@ -96,6 +103,10 @@ static int conaddr_comparator (void *unused, uint16_t *v1, uint16_t *v2)
 
 static Connection * find_connection (uint16_t port)
 {
+    if (!connections_tree_initialized) {
+        return NULL;
+    }
+
     BAVLNode *tree_node = BAVL_LookupExact(&connections_tree, &port);
     if (!tree_node) {
         return NULL;
@@ -114,28 +125,53 @@ static void remove_connection (Connection *con)
     }
 }
 
-static void insert_connection (BAddr local_addr, BAddr remote_addr, uint16_t port)
+static void init_connections_tree (void)
 {
-   Connection * con = find_connection(port);
-   if (con != NULL)
-       con->count += 1;
-   else
-   {
-       Connection * tmp = (Connection *)malloc(sizeof(Connection));
-       tmp->local_addr = local_addr;
-       tmp->remote_addr = remote_addr;
-       tmp->port = port;
-       tmp->count = 1;
-       BAVL_Insert(&connections_tree, &tmp->connections_tree_node, NULL);
-   }
+    if (!connections_tree_initialized) {
+        BAVL_Init(&connections_tree, OFFSET_DIFF(Connection, port, connections_tree_node), (BAVL_comparator)conaddr_comparator, NULL);
+        connections_tree_initialized = 1;
+    }
+}
+
+static int insert_connection (BAddr local_addr, BAddr remote_addr, uint16_t port)
+{
+    init_connections_tree();
+
+    Connection * con = find_connection(port);
+    if (con != NULL) {
+        con->count += 1;
+        return 1;
+    } else {
+        Connection * tmp = (Connection *)malloc(sizeof(Connection));
+        if (!tmp) {
+            BLog(BLOG_ERROR, "DNS connection tracking allocation failed");
+            return 0;
+        }
+        tmp->local_addr = local_addr;
+        tmp->remote_addr = remote_addr;
+        tmp->port = port;
+        tmp->count = 1;
+        if (!BAVL_Insert(&connections_tree, &tmp->connections_tree_node, NULL)) {
+            BLog(BLOG_ERROR, "DNS connection tracking insert failed");
+            free(tmp);
+            return 0;
+        }
+        return 1;
+    }
 }
 
 static void free_connections()
 {
+    if (!connections_tree_initialized) {
+        return;
+    }
+
     while (!BAVL_IsEmpty(&connections_tree)) {
         Connection *con = UPPER_OBJECT(BAVL_GetLast(&connections_tree), Connection, connections_tree_node);
         BAVL_Remove(&connections_tree, &con->connections_tree_node);
+        free(con);
     }
+    connections_tree_initialized = 0;
 }
 
 static void tcp_remove(struct tcp_pcb* pcb_list)
@@ -170,6 +206,14 @@ static void tcp_remove(struct tcp_pcb* pcb_list)
     BReactor_Synchronize(&ss, &sync_mark.base); \
     BPending_Free(&sync_mark);
 
+// --- Memory Pool Implementation ---
+#include <tun2socks/MemoryPool.h>
+
+static MemoryPool client_pool;
+static MemoryPool buf_pool;
+static MemoryPool socks_buf_pool;
+// ----------------------------------
+
 // command-line options
 struct {
     int help;
@@ -193,6 +237,9 @@ struct {
     int udpgw_max_connections;
     int udpgw_connection_buffer_size;
     int udpgw_transparent_dns;
+    int tcp_snd_buf;
+    int tcp_wnd;
+    int socks_buf;
 #ifdef ANDROID
     int tun_fd;
     int tun_mtu;
@@ -214,7 +261,7 @@ struct tcp_client {
     BAddr remote_addr;
     struct tcp_pcb *pcb;
     int client_closed;
-    uint8_t buf[TCP_WND];
+    uint8_t *buf;
     int buf_used;
     char *socks_username;
     BSocksClient socks_client;
@@ -222,7 +269,7 @@ struct tcp_client {
     int socks_closed;
     StreamPassInterface *socks_send_if;
     StreamRecvInterface *socks_recv_if;
-    uint8_t socks_recv_buf[CLIENT_SOCKS_RECV_BUF_SIZE];
+    uint8_t *socks_recv_buf;
     int socks_recv_buf_used;
     int socks_recv_buf_sent;
     int socks_recv_waiting;
@@ -340,6 +387,11 @@ static int client_socks_recv_send_out (struct tcp_client *client);
 static err_t client_sent_func (void *arg, struct tcp_pcb *tpcb, u16_t len);
 static void udpgw_client_handler_received (void *unused, BAddr local_addr, BAddr remote_addr, const uint8_t *data, int data_len);
 
+static int parse_positive_int_arg(const char *arg, const char *value, int min_value, int max_value, int *out);
+static int clamp_int_value(const char *name, int value, int min_value, int max_value);
+static void log_pool_stats(const char *name, MemoryPool *pool);
+static int send_device_packet_checked(const char *source, const uint8_t *packet, int packet_len);
+
 #ifdef ANDROID
 static void daemonize(const char* path) {
 
@@ -389,6 +441,21 @@ static void daemonize(const char* path) {
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
 }
+
+static void set_android_process_name(char *argv0)
+{
+    static const char process_name[] = "io.github.xSocks";
+
+    if (argv0) {
+        size_t argv0_len = strlen(argv0);
+        if (argv0_len > 0) {
+            memset(argv0, 0, argv0_len);
+            strncpy(argv0, process_name, argv0_len);
+        }
+    }
+
+    prctl(PR_SET_NAME, process_name);
+}
 #endif
 
 int main (int argc, char **argv)
@@ -407,11 +474,11 @@ int main (int argc, char **argv)
         goto fail0;
     }
 
+#ifdef ANDROID
     if (options.fake_proc) {
-        // Fake process name to cheat on Lollipop
-        strcpy(argv[0], "io.github.xSocks");
-        prctl(PR_SET_NAME, "io.github.xSocks");
+        set_android_process_name(argv[0]);
     }
+#endif
 
     // handle --help and --version
     if (options.help) {
@@ -474,6 +541,14 @@ int main (int argc, char **argv)
         goto fail1;
     }
 
+    // init memory pools
+    pool_init(&client_pool, sizeof(struct tcp_client));
+    pool_init(&buf_pool, g_tcp_wnd);
+    pool_init(&socks_buf_pool, g_socks_buf_size);
+    pool_set_max_cached(&client_pool, CLIENT_POOL_CACHE_LIMIT);
+    pool_set_max_cached(&buf_pool, CLIENT_BUFFER_POOL_CACHE_LIMIT);
+    pool_set_max_cached(&socks_buf_pool, CLIENT_BUFFER_POOL_CACHE_LIMIT);
+
     // init time
     BTime_Init();
 
@@ -523,7 +598,7 @@ int main (int argc, char **argv)
     for (;;) {
         int sock2;
         struct sockaddr_un remote;
-        int t = sizeof(remote);
+        socklen_t t = sizeof(remote);
         if ((sock2 = accept(sock, (struct sockaddr *)&remote, &t)) == -1) { 
             BLog(BLOG_ERROR, "accept() failed: %s (sock = %d)\n", strerror(errno), sock);
             continue;
@@ -633,7 +708,7 @@ int main (int argc, char **argv)
 
     // free clients
     LinkedList1Node *node;
-    while (node = LinkedList1_GetFirst(&tcp_clients)) {
+    while ((node = LinkedList1_GetFirst(&tcp_clients))) {
         struct tcp_client *client = UPPER_OBJECT(node, struct tcp_client, list_node);
         client_murder(client);
     }
@@ -677,6 +752,13 @@ fail3:
 fail2:
     BReactor_Free(&ss);
 fail1:
+    log_pool_stats("client", &client_pool);
+    log_pool_stats("tcp-buffer", &buf_pool);
+    log_pool_stats("socks-buffer", &socks_buf_pool);
+    pool_free_all(&client_pool);
+    pool_free_all(&buf_pool);
+    pool_free_all(&socks_buf_pool);
+
     BFree(password_file_contents);
     BLog(BLOG_NOTICE, "exiting");
     BLog_Free();
@@ -733,16 +815,10 @@ void print_help (const char *name)
         "        [--password <password>]\n"
         "        [--password-file <file>]\n"
         "        [--append-source-to-username]\n"
-#ifdef ANDROID
-        "        [--enable-udprelay]\n"
-        "        [--udpgw-remote-server-addr <addr>]\n"
-        "        [--udprelay-max-connections <number>]\n"
-#else
         "        [--udpgw-remote-server-addr <addr>]\n"
         "        [--udpgw-max-connections <number>]\n"
         "        [--udpgw-connection-buffer-size <number>]\n"
         "        [--udpgw-transparent-dns]\n"
-#endif
         "Address format is a.b.c.d:port (IPv4) or [addr]:port (IPv6).\n",
         name
     );
@@ -791,6 +867,9 @@ int parse_arguments (int argc, char *argv[])
     options.udpgw_max_connections = DEFAULT_UDPGW_MAX_CONNECTIONS;
     options.udpgw_connection_buffer_size = DEFAULT_UDPGW_CONNECTION_BUFFER_SIZE;
     options.udpgw_transparent_dns = 0;
+    options.tcp_snd_buf = 0;
+    options.tcp_wnd = 0;
+    options.socks_buf = 0;
 
     int i;
     for (i = 1; i < argc; i++) {
@@ -877,8 +956,7 @@ int parse_arguments (int argc, char *argv[])
                 fprintf(stderr, "%s: requires an argument\n", arg);
                 return 0;
             }
-            if ((options.tun_fd = atoi(argv[i + 1])) <= 0) {
-                fprintf(stderr, "%s: wrong argument\n", arg);
+            if (!parse_positive_int_arg(arg, argv[i + 1], 1, INT_MAX, &options.tun_fd)) {
                 return 0;
             }
             i++;
@@ -896,8 +974,7 @@ int parse_arguments (int argc, char *argv[])
                 fprintf(stderr, "%s: requires an argument\n", arg);
                 return 0;
             }
-            if ((options.tun_mtu = atoi(argv[i + 1])) <= 0) {
-                fprintf(stderr, "%s: wrong argument\n", arg);
+            if (!parse_positive_int_arg(arg, argv[i + 1], 576, 9000, &options.tun_mtu)) {
                 return 0;
             }
             i++;
@@ -987,14 +1064,6 @@ int parse_arguments (int argc, char *argv[])
         else if (!strcmp(arg, "--append-source-to-username")) {
             options.append_source_to_username = 1;
         }
-#ifdef ANDROID
-        else if (!strcmp(arg, "--enable-udprelay")) {
-#ifdef BADVPN_ANDROID_UDPGW
-            options.udpgw_remote_server_addr = "127.0.0.1:7300";
-#else
-            options.udpgw_remote_server_addr = "0.0.0.0:0";
-#endif
-        }
         else if (!strcmp(arg, "--udpgw-remote-server-addr")) {
             if (1 >= argc - i) {
                 fprintf(stderr, "%s: requires an argument\n", arg);
@@ -1002,39 +1071,23 @@ int parse_arguments (int argc, char *argv[])
             }
             options.udpgw_remote_server_addr = argv[i + 1];
             i++;
-#else
-        else if (!strcmp(arg, "--udpgw-remote-server-addr")) {
-            if (1 >= argc - i) {
-                fprintf(stderr, "%s: requires an argument\n", arg);
-                return 0;
-            }
-            options.udpgw_remote_server_addr = argv[i + 1];
-            i++;
-#endif
         }
-#ifdef ANDROID
-        else if (!strcmp(arg, "--udprelay-max-connections")) {
-#else
         else if (!strcmp(arg, "--udpgw-max-connections")) {
-#endif
             if (1 >= argc - i) {
                 fprintf(stderr, "%s: requires an argument\n", arg);
                 return 0;
             }
-            if ((options.udpgw_max_connections = atoi(argv[i + 1])) <= 0) {
-                fprintf(stderr, "%s: wrong argument\n", arg);
+            if (!parse_positive_int_arg(arg, argv[i + 1], 1, 4096, &options.udpgw_max_connections)) {
                 return 0;
             }
             i++;
         }
-#ifndef ANDROID
         else if (!strcmp(arg, "--udpgw-connection-buffer-size")) {
             if (1 >= argc - i) {
                 fprintf(stderr, "%s: requires an argument\n", arg);
                 return 0;
             }
-            if ((options.udpgw_connection_buffer_size = atoi(argv[i + 1])) <= 0) {
-                fprintf(stderr, "%s: wrong argument\n", arg);
+            if (!parse_positive_int_arg(arg, argv[i + 1], 1, 4096, &options.udpgw_connection_buffer_size)) {
                 return 0;
             }
             i++;
@@ -1042,7 +1095,36 @@ int parse_arguments (int argc, char *argv[])
         else if (!strcmp(arg, "--udpgw-transparent-dns")) {
             options.udpgw_transparent_dns = 1;
         }
-#endif
+        else if (!strcmp(arg, "--tcp-snd-buf")) {
+            if (1 >= argc - i) {
+                fprintf(stderr, "%s: requires an argument\n", arg);
+                return 0;
+            }
+            if (!parse_positive_int_arg(arg, argv[i + 1], 1, INT_MAX, &options.tcp_snd_buf)) {
+                return 0;
+            }
+            i++;
+        }
+        else if (!strcmp(arg, "--tcp-wnd")) {
+            if (1 >= argc - i) {
+                fprintf(stderr, "%s: requires an argument\n", arg);
+                return 0;
+            }
+            if (!parse_positive_int_arg(arg, argv[i + 1], 1, INT_MAX, &options.tcp_wnd)) {
+                return 0;
+            }
+            i++;
+        }
+        else if (!strcmp(arg, "--socks-buf")) {
+            if (1 >= argc - i) {
+                fprintf(stderr, "%s: requires an argument\n", arg);
+                return 0;
+            }
+            if (!parse_positive_int_arg(arg, argv[i + 1], 1, INT_MAX, &options.socks_buf)) {
+                return 0;
+            }
+            i++;
+        }
         else {
             fprintf(stderr, "unknown option: %s\n", arg);
             return 0;
@@ -1172,6 +1254,71 @@ int process_arguments (void)
     }
 #endif
 
+    if (options.tcp_snd_buf) {
+        options.tcp_snd_buf = clamp_int_value("tcp_snd_buf", options.tcp_snd_buf, CLIENT_TCP_BUF_MIN, CLIENT_TCP_BUF_MAX);
+        g_tcp_snd_buf = (u16_t)options.tcp_snd_buf;
+    }
+    if (options.tcp_wnd) {
+        options.tcp_wnd = clamp_int_value("tcp_wnd", options.tcp_wnd, CLIENT_TCP_BUF_MIN, CLIENT_TCP_BUF_MAX);
+        g_tcp_wnd = (u16_t)options.tcp_wnd;
+    }
+    if (options.socks_buf) {
+        options.socks_buf = clamp_int_value("socks_buf", options.socks_buf, CLIENT_SOCKS_RECV_BUF_MIN, CLIENT_SOCKS_RECV_BUF_MAX);
+        g_socks_buf_size = options.socks_buf;
+    }
+
+    return 1;
+}
+
+static int parse_positive_int_arg(const char *arg, const char *value, int min_value, int max_value, int *out)
+{
+    char *end = NULL;
+    long parsed;
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
+        fprintf(stderr, "%s: expected integer in range %d..%d\n", arg, min_value, max_value);
+        return 0;
+    }
+
+    *out = (int)parsed;
+    return 1;
+}
+
+static int clamp_int_value(const char *name, int value, int min_value, int max_value)
+{
+    if (value < min_value) {
+        BLog(BLOG_WARNING, "%s too small (%d), using %d", name, value, min_value);
+        return min_value;
+    }
+    if (value > max_value) {
+        BLog(BLOG_WARNING, "%s too large (%d), using %d", name, value, max_value);
+        return max_value;
+    }
+    return value;
+}
+
+static void log_pool_stats(const char *name, MemoryPool *pool)
+{
+    size_t cached = 0;
+    size_t outstanding = 0;
+    size_t high_watermark = 0;
+
+    pool_get_stats(pool, &cached, &outstanding, &high_watermark);
+    BLog(BLOG_INFO, "pool %s: cached=%zu outstanding=%zu high_watermark=%zu", name, cached, outstanding, high_watermark);
+}
+
+static int send_device_packet_checked(const char *source, const uint8_t *packet, int packet_len)
+{
+    int mtu = BTap_GetMTU(&device);
+
+    if (packet_len <= 0 || packet_len > mtu) {
+        BLog(BLOG_WARNING, "%s: dropping packet length %d (mtu %d)", source, packet_len, mtu);
+        return 0;
+    }
+
+    BTap_Send(&device, (uint8_t *)packet, packet_len);
     return 1;
 }
 
@@ -1304,7 +1451,7 @@ void tcp_timer_handler (void *unused)
 
     // schedule next timer
     // TODO: calculate timeout so we don't drift
-    BReactor_SetTimer(&ss, &tcp_timer);
+    BReactor_SetTimerAbsolute(&ss, &tcp_timer, btime_add(tcp_timer.base.absTime, TCP_TMR_INTERVAL));
 
     tcp_tmr();
     return;
@@ -1373,8 +1520,6 @@ int process_device_dns_packet (uint8_t *data, int data_len)
         goto fail;
     }
 
-    static int init = 0;
-
     int to_dns;
     int from_dns;
     int packet_length = 0;
@@ -1405,13 +1550,12 @@ int process_device_dns_packet (uint8_t *data, int data_len)
 
             // verify UDP checksum
             uint16_t checksum_in_packet = udp_header.checksum;
-            udp_header.checksum = 0;
-            uint16_t checksum_computed = udp_checksum(&udp_header, data, data_len, ipv4_header.source_address, ipv4_header.destination_address);
-            // IPv4 UDP checksum 0 means checksum disabled and is valid.
-            // Some Android TUN paths emit DNS packets this way; rejecting them makes
-            // the packet bypass dnsgw, so pdnsd never receives the query.
-            if (checksum_in_packet != 0 && checksum_in_packet != checksum_computed) {
-                goto fail;
+            if (checksum_in_packet != 0) {
+                udp_header.checksum = 0;
+                uint16_t checksum_computed = udp_checksum(&udp_header, data, data_len, ipv4_header.source_address, ipv4_header.destination_address);
+                if (checksum_in_packet != checksum_computed) {
+                    goto fail;
+                }
             }
 
             // to port 53 is considered a DNS packet
@@ -1430,15 +1574,13 @@ int process_device_dns_packet (uint8_t *data, int data_len)
                 BLog(BLOG_INFO, "UDP: to DNS %d bytes", data_len);
 
                 // construct addresses
-                if (!init) {
-                    init = 1;
-                    BAVL_Init(&connections_tree, OFFSET_DIFF(Connection, port, connections_tree_node), (BAVL_comparator)conaddr_comparator, NULL);
-                }
                 BAddr local_addr;
                 BAddr remote_addr;
                 BAddr_InitIPv4(&local_addr, ipv4_header.source_address, udp_header.source_port);
                 BAddr_InitIPv4(&remote_addr, ipv4_header.destination_address, udp_header.dest_port);
-                insert_connection(local_addr, remote_addr, udp_header.source_port);
+                if (!insert_connection(local_addr, remote_addr, udp_header.source_port)) {
+                    goto fail;
+                }
 
                 // build IP header
                 ipv4_header.destination_address = dnsgw.ipv4.ip;
@@ -1450,7 +1592,7 @@ int process_device_dns_packet (uint8_t *data, int data_len)
             } else if (from_dns) {
 
                 // if not initialized
-                if (!init) {
+                if (!connections_tree_initialized) {
                     goto fail;
                 }
 
@@ -1459,6 +1601,47 @@ int process_device_dns_packet (uint8_t *data, int data_len)
                 Connection * con = find_connection(udp_header.dest_port);
                 if (con != NULL)
                 {
+                    if (con->local_addr.type == BADDR_TYPE_IPV6) {
+                        BLog(BLOG_INFO, "UDP/IPv6: from DNS %d bytes", data_len);
+
+                        // build IPv6 header
+                        struct ipv6_header ipv6_h;
+                        ipv6_h.version4_tc4 = hton8(0x60);
+                        ipv6_h.tc4_fl4 = hton8(0);
+                        ipv6_h.fl = hton16(0);
+                        ipv6_h.payload_length = hton16(sizeof(struct udp_header) + data_len);
+                        ipv6_h.next_header = hton8(IPV6_NEXT_UDP);
+                        ipv6_h.hop_limit = hton8(64);
+                        memcpy(ipv6_h.source_address, con->remote_addr.ipv6.ip, 16);
+                        memcpy(ipv6_h.destination_address, con->local_addr.ipv6.ip, 16);
+
+                        // build UDP header
+                        udp_header.source_port = con->remote_addr.ipv6.port;
+                        udp_header.dest_port = con->local_addr.ipv6.port;
+                        udp_header.length = hton16(sizeof(udp_header) + data_len);
+
+                        // update UDP header's checksum
+                        udp_header.checksum = hton16(0);
+                        udp_header.checksum = udp_ip6_checksum(&udp_header, data, data_len,
+                                ipv6_h.source_address, ipv6_h.destination_address);
+
+                        packet_length = sizeof(ipv6_h) + sizeof(udp_header) + data_len;
+                        if (packet_length > BTap_GetMTU(&device)) {
+                            BLog(BLOG_ERROR, "DNS IPv6 response packet is too large");
+                            remove_connection(con);
+                            goto fail;
+                        }
+
+                        // write packet
+                        memcpy(device_write_buf, &ipv6_h, sizeof(ipv6_h));
+                        memcpy(device_write_buf + sizeof(ipv6_h), &udp_header, sizeof(udp_header));
+                        memcpy(device_write_buf + sizeof(ipv6_h) + sizeof(udp_header), data, data_len);
+
+                        remove_connection(con);
+
+                        break;
+                    }
+
                     // build IP header
                     ipv4_header.source_address = con->remote_addr.ipv4.ip;
                     ipv4_header.destination_address = con->local_addr.ipv4.ip;
@@ -1484,17 +1667,103 @@ int process_device_dns_packet (uint8_t *data, int data_len)
             udp_header.checksum = udp_checksum(&udp_header, data, data_len,
                     ipv4_header.source_address, ipv4_header.destination_address);
 
+            packet_length = sizeof(ipv4_header) + sizeof(udp_header) + data_len;
+            if (packet_length > BTap_GetMTU(&device)) {
+                BLog(BLOG_ERROR, "DNS IPv4 packet is too large");
+                goto fail;
+            }
+
             // write packet
             memcpy(device_write_buf, &ipv4_header, sizeof(ipv4_header));
             memcpy(device_write_buf + sizeof(ipv4_header), &udp_header, sizeof(udp_header));
             memcpy(device_write_buf + sizeof(ipv4_header) + sizeof(udp_header), data, data_len);
-            packet_length = sizeof(ipv4_header) + sizeof(udp_header) + data_len;
 
         } break;
 
         case 6: {
-            // TODO: support IPv6 DNS Gateway
-            goto fail;
+            // ignore if IPv6 support is disabled
+            if (!options.netif_ip6addr) {
+                goto fail;
+            }
+
+            // ignore non-UDP packets
+            if (data_len < sizeof(struct ipv6_header) || data[offsetof(struct ipv6_header, next_header)] != IPV6_NEXT_UDP) {
+                goto fail;
+            }
+
+            // parse IPv6 header
+            struct ipv6_header ipv6_header;
+            if (!ipv6_check(data, data_len, &ipv6_header, &data, &data_len)) {
+                goto fail;
+            }
+
+            // parse UDP
+            struct udp_header udp_header;
+            if (!udp_check(data, data_len, &udp_header, &data, &data_len)) {
+                goto fail;
+            }
+
+            // verify UDP checksum
+            uint16_t checksum_in_packet = udp_header.checksum;
+            udp_header.checksum = 0;
+            uint16_t checksum_computed = udp_ip6_checksum(&udp_header, data, data_len, ipv6_header.source_address, ipv6_header.destination_address);
+            if (checksum_in_packet != checksum_computed) {
+                goto fail;
+            }
+
+            // to port 53 is considered a DNS packet
+            to_dns = udp_header.dest_port == hton16(53);
+
+            // if not DNS packet, just bypass it.
+            if (!to_dns) {
+                goto fail;
+            }
+
+            BLog(BLOG_INFO, "UDP/IPv6: to DNS %d bytes", data_len);
+
+            // construct addresses
+            BAddr local_addr;
+            BAddr remote_addr;
+            BAddr_InitIPv6(&local_addr, ipv6_header.source_address, udp_header.source_port);
+            BAddr_InitIPv6(&remote_addr, ipv6_header.destination_address, udp_header.dest_port);
+            if (!insert_connection(local_addr, remote_addr, udp_header.source_port)) {
+                goto fail;
+            }
+
+            // build IPv4 header
+            struct ipv4_header ipv4_h;
+            ipv4_h.version4_ihl4 = IPV4_MAKE_VERSION_IHL(sizeof(ipv4_h));
+            ipv4_h.ds = hton8(0);
+            ipv4_h.total_length = hton16(sizeof(ipv4_h) + sizeof(struct udp_header) + data_len);
+            ipv4_h.identification = hton16(0);
+            ipv4_h.flags3_fragmentoffset13 = hton16(0);
+            ipv4_h.ttl = hton8(64);
+            ipv4_h.protocol = hton8(IPV4_PROTOCOL_UDP);
+            ipv4_h.checksum = hton16(0);
+            ipv4_h.source_address = netif_ipaddr.ipv4;
+            ipv4_h.destination_address = dnsgw.ipv4.ip;
+            ipv4_h.checksum = ipv4_checksum(&ipv4_h, NULL, 0);
+
+            // build UDP header
+            udp_header.dest_port = dnsgw.ipv4.port;
+            udp_header.length = hton16(sizeof(udp_header) + data_len);
+
+            // update UDP header's checksum
+            udp_header.checksum = hton16(0);
+            udp_header.checksum = udp_checksum(&udp_header, data, data_len,
+                    ipv4_h.source_address, ipv4_h.destination_address);
+
+            packet_length = sizeof(ipv4_h) + sizeof(udp_header) + data_len;
+            if (packet_length > BTap_GetMTU(&device)) {
+                BLog(BLOG_ERROR, "DNS IPv6 redirect packet is too large");
+                goto fail;
+            }
+
+            // write packet
+            memcpy(device_write_buf, &ipv4_h, sizeof(ipv4_h));
+            memcpy(device_write_buf + sizeof(ipv4_h), &udp_header, sizeof(udp_header));
+            memcpy(device_write_buf + sizeof(ipv4_h) + sizeof(udp_header), data, data_len);
+
         } break;
 
         default: {
@@ -1503,7 +1772,9 @@ int process_device_dns_packet (uint8_t *data, int data_len)
     }
 
     // submit packet
-    BTap_Send(&device, device_write_buf, packet_length);
+    if (!send_device_packet_checked("dns redirect", device_write_buf, packet_length)) {
+        goto fail;
+    }
 
     return 1;
 
@@ -1551,12 +1822,12 @@ int process_device_udp_packet (uint8_t *data, int data_len)
 
             // verify UDP checksum
             uint16_t checksum_in_packet = udp_header.checksum;
-            udp_header.checksum = 0;
-            uint16_t checksum_computed = udp_checksum(&udp_header, data, data_len, ipv4_header.source_address, ipv4_header.destination_address);
-            // IPv4 UDP checksum 0 means checksum disabled and is valid.
-            // Some Android TUN paths emit UDP packets this way.
-            if (checksum_in_packet != 0 && checksum_in_packet != checksum_computed) {
-                goto fail;
+            if (checksum_in_packet != 0) {
+                udp_header.checksum = 0;
+                uint16_t checksum_computed = udp_checksum(&udp_header, data, data_len, ipv4_header.source_address, ipv4_header.destination_address);
+                if (checksum_in_packet != checksum_computed) {
+                    goto fail;
+                }
             }
 
             BLog(BLOG_INFO, "UDP: from device %d bytes", data_len);
@@ -1673,7 +1944,7 @@ err_t common_netif_output (struct netif *netif, struct pbuf *p)
         }
 
         SYNC_FROMHERE
-        BTap_Send(&device, (uint8_t *)p->payload, p->len);
+        send_device_packet_checked("netif output", (uint8_t *)p->payload, p->len);
         SYNC_COMMIT
     } else {
         int len = 0;
@@ -1684,10 +1955,10 @@ err_t common_netif_output (struct netif *netif, struct pbuf *p)
             }
             memcpy(device_write_buf + len, p->payload, p->len);
             len += p->len;
-        } while (p = p->next);
+        } while ((p = p->next));
 
         SYNC_FROMHERE
-        BTap_Send(&device, device_write_buf, len);
+        send_device_packet_checked("netif output", device_write_buf, len);
         SYNC_COMMIT
     }
 
@@ -1744,9 +2015,22 @@ err_t listener_accept_func (void *arg, struct tcp_pcb *newpcb, err_t err)
     tcp_accepted(this_listener);
 
     // allocate client structure
-    struct tcp_client *client = (struct tcp_client *)malloc(sizeof(*client));
+    struct tcp_client *client = (struct tcp_client *)pool_alloc_zero(&client_pool);
     if (!client) {
-        BLog(BLOG_ERROR, "listener accept: malloc failed");
+        BLog(BLOG_ERROR, "listener accept: pool_alloc failed");
+        goto fail0;
+    }
+    client->buf = (uint8_t *)pool_alloc(&buf_pool);
+    if (!client->buf) {
+        BLog(BLOG_ERROR, "listener accept: pool_alloc failed (buf)");
+        pool_free(&client_pool, client);
+        goto fail0;
+    }
+    client->socks_recv_buf = (uint8_t *)pool_alloc(&socks_buf_pool);
+    if (!client->socks_recv_buf) {
+        BLog(BLOG_ERROR, "listener accept: pool_alloc failed (socks_recv_buf)");
+        pool_free(&buf_pool, client->buf);
+        pool_free(&client_pool, client);
         goto fail0;
     }
     client->socks_username = NULL;
@@ -1831,7 +2115,9 @@ err_t listener_accept_func (void *arg, struct tcp_pcb *newpcb, err_t err)
 fail1:
     SYNC_BREAK
     free(client->socks_username);
-    free(client);
+    pool_free(&buf_pool, client->buf);
+    pool_free(&socks_buf_pool, client->socks_recv_buf);
+    pool_free(&client_pool, client);
 fail0:
     return ERR_MEM;
 }
@@ -1973,7 +2259,9 @@ void client_dealloc (struct tcp_client *client)
 
     // free memory
     free(client->socks_username);
-    free(client);
+    pool_free(&buf_pool, client->buf);
+    pool_free(&socks_buf_pool, client->socks_recv_buf);
+    pool_free(&client_pool, client);
 }
 
 void client_err_func (void *arg, err_t err)
@@ -2003,7 +2291,7 @@ err_t client_recv_func (void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t e
     ASSERT(p->tot_len > 0)
 
     // check if we have enough buffer
-    if (p->tot_len > sizeof(client->buf) - client->buf_used) {
+    if (p->tot_len > g_tcp_wnd - client->buf_used) {
         client_log(client, BLOG_ERROR, "no buffer for data !?!");
         return ERR_MEM;
     }
@@ -2135,13 +2423,13 @@ void client_socks_recv_initiate (struct tcp_client *client)
     ASSERT(client->socks_up)
     ASSERT(client->socks_recv_buf_used == -1)
 
-    StreamRecvInterface_Receiver_Recv(client->socks_recv_if, client->socks_recv_buf, sizeof(client->socks_recv_buf));
+    StreamRecvInterface_Receiver_Recv(client->socks_recv_if, client->socks_recv_buf, g_socks_buf_size);
 }
 
 void client_socks_recv_handler_done (struct tcp_client *client, int data_len)
 {
     ASSERT(data_len > 0)
-    ASSERT(data_len <= sizeof(client->socks_recv_buf))
+    ASSERT(data_len <= g_socks_buf_size)
     ASSERT(!client->socks_closed)
     ASSERT(client->socks_up)
     ASSERT(client->socks_recv_buf_used == -1)

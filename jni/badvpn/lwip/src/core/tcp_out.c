@@ -60,6 +60,8 @@
 
 #include <string.h>
 
+extern u16_t g_tcp_wnd;
+
 /* Define some copy-macros for checksum-on-copy so that the code looks
    nicer by preventing too many ifdef's. */
 #if TCP_CHECKSUM_ON_COPY
@@ -1224,7 +1226,7 @@ tcp_rst_impl(u32_t seqno, u32_t ackno,
   tcphdr->seqno = htonl(seqno);
   tcphdr->ackno = htonl(ackno);
   TCPH_HDRLEN_FLAGS_SET(tcphdr, TCP_HLEN/4, TCP_RST | TCP_ACK);
-  tcphdr->wnd = PP_HTONS(TCP_WND);
+  tcphdr->wnd = htons(g_tcp_wnd);
   tcphdr->chksum = 0;
   tcphdr->urgp = 0;
 

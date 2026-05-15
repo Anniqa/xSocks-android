@@ -62,6 +62,8 @@
 #include "lwip/nd6.h"
 #endif /* LWIP_ND6_TCP_REACHABILITY_HINTS */
 
+extern u16_t g_tcp_wnd;
+
 /* These variables are global to all functions involved in the input
    processing of TCP segments. They are set by the tcp_input()
    function. */
@@ -395,7 +397,7 @@ tcp_input(struct pbuf *p, struct netif *inp)
           } else {
             /* correct rcv_wnd as the application won't call tcp_recved()
                for the FIN's seqno */
-            if (pcb->rcv_wnd != TCP_WND) {
+            if (pcb->rcv_wnd != g_tcp_wnd) {
               pcb->rcv_wnd++;
             }
             TCP_EVENT_CLOSED(pcb, err);

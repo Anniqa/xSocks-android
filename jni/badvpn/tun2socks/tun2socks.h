@@ -28,13 +28,22 @@
 #define PROGRAM_NAME "tun2socks"
 
 // size of temporary buffer for passing data from the SOCKS server to TCP for sending
-#define CLIENT_SOCKS_RECV_BUF_SIZE 8192
+#define CLIENT_SOCKS_RECV_BUF_SIZE 65536
+
+// Android memory guardrails. Values are intentionally conservative because
+// each active TCP client owns both a lwIP-side and SOCKS-side buffer.
+#define CLIENT_TCP_BUF_MIN 4096
+#define CLIENT_TCP_BUF_MAX 65535
+#define CLIENT_SOCKS_RECV_BUF_MIN 4096
+#define CLIENT_SOCKS_RECV_BUF_MAX 1048576
+#define CLIENT_POOL_CACHE_LIMIT 256
+#define CLIENT_BUFFER_POOL_CACHE_LIMIT 32
 
 // maximum number of udpgw connections
 #define DEFAULT_UDPGW_MAX_CONNECTIONS 256
 
 // udpgw per-connection send buffer size, in number of packets
-#define DEFAULT_UDPGW_CONNECTION_BUFFER_SIZE 8
+#define DEFAULT_UDPGW_CONNECTION_BUFFER_SIZE 32
 
 // udpgw reconnect time after connection fails
 #define UDPGW_RECONNECT_TIME 5000
