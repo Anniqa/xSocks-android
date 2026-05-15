@@ -199,6 +199,7 @@ struct {
     int fake_proc;
     char *pid;
     char *dnsgw;
+    char *tun_fd_socket_path;
 #else
     char *tundev;
 #endif
@@ -501,7 +502,7 @@ int main (int argc, char **argv)
         goto fail2;
     }
 
-    char *path = "/data/data/io.github.xSocks/sock_path";
+    char *path = options.tun_fd_socket_path;
     unlink(path);
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
@@ -589,7 +590,7 @@ int main (int argc, char **argv)
         }
 
         // init udpgw client
-        if (!SocksUdpGwClient_Init(&udpgw_client, udp_mtu, DEFAULT_UDPGW_MAX_CONNECTIONS, options.udpgw_connection_buffer_size, UDPGW_KEEPALIVE_TIME,
+        if (!SocksUdpGwClient_Init(&udpgw_client, udp_mtu, options.udpgw_max_connections, options.udpgw_connection_buffer_size, UDPGW_KEEPALIVE_TIME,
                                    socks_server_addr, socks_auth_info, socks_num_auth_info,
                                    udpgw_remote_server_addr, UDPGW_RECONNECT_TIME, &ss, NULL, udpgw_client_handler_received
         )) {
@@ -717,6 +718,7 @@ void print_help (const char *name)
 #ifdef ANDROID
         "        [--fake-proc]\n"
         "        [--tunfd <fd>]\n"
+        "        [--tunfd-socket-path <path>]\n"
         "        [--tunmtu <mtu>]\n"
         "        [--dnsgw <dns_gateway_address>]\n"
         "        [--pid <pid_file>]\n"
@@ -733,6 +735,7 @@ void print_help (const char *name)
         "        [--append-source-to-username]\n"
 #ifdef ANDROID
         "        [--enable-udprelay]\n"
+        "        [--udpgw-remote-server-addr <addr>]\n"
         "        [--udprelay-max-connections <number>]\n"
 #else
         "        [--udpgw-remote-server-addr <addr>]\n"
@@ -772,6 +775,7 @@ int parse_arguments (int argc, char *argv[])
     options.tun_mtu = 1500;
     options.fake_proc = 0;
     options.pid = NULL;
+    options.tun_fd_socket_path = "/data/data/io.github.xSocks/sock_path";
 #else
     options.tundev = NULL;
 #endif
@@ -879,6 +883,14 @@ int parse_arguments (int argc, char *argv[])
             }
             i++;
         }
+        else if (!strcmp(arg, "--tunfd-socket-path")) {
+            if (1 >= argc - i) {
+                fprintf(stderr, "%s: requires an argument\n", arg);
+                return 0;
+            }
+            options.tun_fd_socket_path = argv[i + 1];
+            i++;
+        }
         else if (!strcmp(arg, "--tunmtu")) {
             if (1 >= argc - i) {
                 fprintf(stderr, "%s: requires an argument\n", arg);
@@ -977,7 +989,19 @@ int parse_arguments (int argc, char *argv[])
         }
 #ifdef ANDROID
         else if (!strcmp(arg, "--enable-udprelay")) {
+#ifdef BADVPN_ANDROID_UDPGW
+            options.udpgw_remote_server_addr = "127.0.0.1:7300";
+#else
             options.udpgw_remote_server_addr = "0.0.0.0:0";
+#endif
+        }
+        else if (!strcmp(arg, "--udpgw-remote-server-addr")) {
+            if (1 >= argc - i) {
+                fprintf(stderr, "%s: requires an argument\n", arg);
+                return 0;
+            }
+            options.udpgw_remote_server_addr = argv[i + 1];
+            i++;
 #else
         else if (!strcmp(arg, "--udpgw-remote-server-addr")) {
             if (1 >= argc - i) {

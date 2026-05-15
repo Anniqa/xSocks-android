@@ -367,7 +367,8 @@ public class xSocksVpnService extends VpnService {
 
 
         if (config.isUdpDns) {
-            cmd.add("--enable-udprelay");
+            cmd.add("--udpgw-remote-server-addr");
+            cmd.add("127.0.0.1:7300");
         } else {
             cmd.add("--dnsgw");
             cmd.add("26.26.26.1:" + Integer.toString(pdnsdPort));
