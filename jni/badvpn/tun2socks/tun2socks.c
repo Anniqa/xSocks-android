@@ -1407,7 +1407,10 @@ int process_device_dns_packet (uint8_t *data, int data_len)
             uint16_t checksum_in_packet = udp_header.checksum;
             udp_header.checksum = 0;
             uint16_t checksum_computed = udp_checksum(&udp_header, data, data_len, ipv4_header.source_address, ipv4_header.destination_address);
-            if (checksum_in_packet != checksum_computed) {
+            // IPv4 UDP checksum 0 means checksum disabled and is valid.
+            // Some Android TUN paths emit DNS packets this way; rejecting them makes
+            // the packet bypass dnsgw, so pdnsd never receives the query.
+            if (checksum_in_packet != 0 && checksum_in_packet != checksum_computed) {
                 goto fail;
             }
 
@@ -1550,7 +1553,9 @@ int process_device_udp_packet (uint8_t *data, int data_len)
             uint16_t checksum_in_packet = udp_header.checksum;
             udp_header.checksum = 0;
             uint16_t checksum_computed = udp_checksum(&udp_header, data, data_len, ipv4_header.source_address, ipv4_header.destination_address);
-            if (checksum_in_packet != checksum_computed) {
+            // IPv4 UDP checksum 0 means checksum disabled and is valid.
+            // Some Android TUN paths emit UDP packets this way.
+            if (checksum_in_packet != 0 && checksum_in_packet != checksum_computed) {
                 goto fail;
             }
 
